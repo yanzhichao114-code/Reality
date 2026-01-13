@@ -8,11 +8,16 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
-echo "=========================================================="
-echo "   Xray Reality 防偷跑部署脚本      "
-echo "=========================================================="
+# ANSI 颜色定义
+RED_BOLD="\033[31;1m"
+RESET="\033[0m"
 
-# 依赖检查（补齐 pgrep/unzip/jq[可选]）
+# 修改点 1：标题去掉了多余文字，改为红色加粗
+echo -e "${RED_BOLD}==========================================================${RESET}"
+echo -e "${RED_BOLD}                 Xray Reality 脚本                        ${RESET}"
+echo -e "${RED_BOLD}==========================================================${RESET}"
+
+# 依赖检查
 need_cmds=(curl openssl awk grep ss ip systemctl pgrep unzip)
 missing=()
 for c in "${need_cmds[@]}"; do
@@ -23,7 +28,6 @@ if [ "${#missing[@]}" -gt 0 ]; then
   echo "检测到缺少依赖: ${missing[*]}"
   echo "正在更新 apt 源并安装依赖..."
   apt-get update -y >/dev/null
-  # iproute2: ss/ip；procps: pgrep；unzip: 解压 Xray zip
   apt-get install -y curl openssl ca-certificates iproute2 grep gawk procps unzip >/dev/null
 fi
 
@@ -52,7 +56,7 @@ detect_old_xray() {
 }
 
 if [ "$(detect_old_xray)" = "1" ]; then
-  echo "检测到旧版 Xray（运行/服务/残留），正在执行卸载清理..."
+  echo "检测到旧版 Xray，正在执行卸载清理..."
   systemctl stop xray >/dev/null 2>&1 || true
   systemctl disable xray >/dev/null 2>&1 || true
   bash -c "$(curl -fsSL "$XRAY_INSTALL_SCRIPT_URL")" @ remove >/dev/null 2>&1 || true
@@ -69,18 +73,17 @@ INSTALL_SCRIPT="$(curl -fsSL "$XRAY_INSTALL_SCRIPT_URL")" || {
 }
 bash -c "$INSTALL_SCRIPT" @ install
 
-# 定义 Xray 绝对路径
 XRAY_BIN="/usr/local/bin/xray"
 if [ ! -x "$XRAY_BIN" ]; then
-  echo "错误: Xray 二进制文件未找到或不可执行 ($XRAY_BIN)，安装可能失败。"
+  echo "错误: Xray 二进制文件未找到或不可执行 ($XRAY_BIN)。"
   exit 1
 fi
 
-# --- 4. 监听端口配置 ---
+# --- 4. 监听端口配置 (外网端口) ---
 
 echo ""
 while true; do
-  read -rp "请输入 Xray 监听端口 (默认: 443): " input_port
+  read -rp "请输入 Xray 外网监听端口 (默认: 443): " input_port
   PORT=${input_port:-443}
 
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
@@ -94,7 +97,7 @@ while true; do
     continue
   fi
 
-  echo "✅ 端口 ${PORT} 可用。"
+  echo "✅ 外网端口 ${PORT} 可用。"
   break
 done
 
@@ -108,16 +111,13 @@ if ! [[ "$DEST_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]]; then
   exit 1
 fi
 
-# --- 6. 内部回落端口 (新增冲突检查) ---
+# --- 6. 内部回落端口 (支持手动输入) ---
 
-pick_free_port() {
+get_random_suggestion() {
   local p
   while true; do
-    p=$((RANDOM % 50000 + 10000))
-    # 避免随机端口刚好等于公网端口
-    if [ "$p" -eq "$PORT" ]; then
-        continue
-    fi
+    p=$((RANDOM % 30000 + 10000))
+    if [ "$p" -eq "$PORT" ]; then continue; fi
     if ! ss -H -lnt "sport = :$p" | grep -q .; then
       echo "$p"
       return
@@ -125,7 +125,42 @@ pick_free_port() {
   done
 }
 
-INTERNAL_PORT="$(pick_free_port)"
+echo ""
+SUGGEST_PORT="$(get_random_suggestion)"
+
+while true; do
+  read -rp "请输入内部回落端口 (留空则使用随机端口 $SUGGEST_PORT): " input_internal
+  
+  if [ -z "$input_internal" ]; then
+    INTERNAL_PORT="$SUGGEST_PORT"
+    echo "✅ 使用随机内部端口: ${INTERNAL_PORT}"
+    break
+  fi
+
+  if ! [[ "$input_internal" =~ ^[0-9]+$ ]]; then
+    echo "❌ 错误: 请输入有效的数字。"
+    continue
+  fi
+
+  if [ "$input_internal" -lt 1 ] || [ "$input_internal" -gt 65535 ]; then
+    echo "❌ 错误: 端口必须在 1-65535 之间。"
+    continue
+  fi
+
+  if [ "$input_internal" -eq "$PORT" ]; then
+    echo "❌ 错误: 内部端口不能与外网监听端口 ($PORT) 相同，会导致死循环。"
+    continue
+  fi
+
+  if ss -H -lnt "sport = :$input_internal" | grep -q .; then
+    echo "❌ 错误: 端口 $input_internal 已被其他程序占用，请更换。"
+    continue
+  fi
+
+  INTERNAL_PORT="$input_internal"
+  echo "✅ 内部端口设置为: ${INTERNAL_PORT}"
+  break
+done
 
 # --- 7. 生成身份凭证 ---
 
@@ -133,37 +168,32 @@ echo ""
 echo "正在生成身份凭证..."
 
 UUID="$($XRAY_BIN uuid)" || { echo "执行 xray uuid 失败"; exit 1; }
-
 KEYS="$($XRAY_BIN x25519)" || { echo "执行 xray x25519 失败"; exit 1; }
 
-# 获取 PrivateKey
 PRIVATE_KEY="$(echo "$KEYS" | awk -F': ' '/^PrivateKey:/ {print $2; exit}')"
-
-# 优先：用 privateKey 推导 publicKey（最稳）
 PUB_OUT="$($XRAY_BIN x25519 -i "$PRIVATE_KEY" 2>/dev/null || true)"
 PUBLIC_KEY="$(echo "$PUB_OUT" | awk -F': ' '/^PublicKey:/ {print $2; exit}')"
 
-# 兼容：如果推导失败，回退用 Password 充当 publicKey
 if [ -z "${PUBLIC_KEY:-}" ]; then
   PUBLIC_KEY="$(echo "$KEYS" | awk -F': ' '/^Password:/ {print $2; exit}')"
 fi
 
 SHORT_ID="$(openssl rand -hex 4)"
 
-if [ -z "${UUID:-}" ] || [ -z "${PRIVATE_KEY:-}" ] || [ -z "${PUBLIC_KEY:-}" ] || [ -z "${SHORT_ID:-}" ]; then
+if [ -z "${UUID:-}" ] || [ -z "${PRIVATE_KEY:-}" ] || [ -z "${PUBLIC_KEY:-}" ]; then
   echo "❌ 错误: 凭证生成失败。"
-  echo "DEBUG: UUID=$UUID"
-  echo "DEBUG: KEYS=$KEYS"
   exit 1
 fi
 
-# --- 8. 写入配置 (关键修改点) ---
+# --- 8. 写入配置 (保持美化格式) ---
 
 mkdir -p /usr/local/etc/xray
 
 cat > /usr/local/etc/xray/config.json <<EOF
 {
-  "log": { "loglevel": "warning" },
+  "log": {
+    "loglevel": "warning"
+  },
   "inbounds": [
     {
       "tag": "dokodemo-in",
@@ -188,7 +218,10 @@ cat > /usr/local/etc/xray/config.json <<EOF
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${UUID}", "flow": "xtls-rprx-vision" }
+          {
+            "id": "${UUID}",
+            "flow": "xtls-rprx-vision"
+          }
         ],
         "decryption": "none"
       },
@@ -197,9 +230,13 @@ cat > /usr/local/etc/xray/config.json <<EOF
         "security": "reality",
         "realitySettings": {
           "dest": "127.0.0.1:${INTERNAL_PORT}",
-          "serverNames": ["${DEST_DOMAIN}"],
+          "serverNames": [
+            "${DEST_DOMAIN}"
+          ],
           "privateKey": "${PRIVATE_KEY}",
-          "shortIds": ["${SHORT_ID}"]
+          "shortIds": [
+            "${SHORT_ID}"
+          ]
         }
       },
       "sniffing": {
@@ -210,8 +247,14 @@ cat > /usr/local/etc/xray/config.json <<EOF
     }
   ],
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
   ],
   "routing": {
     "rules": [
@@ -265,19 +308,20 @@ if [ -z "$SERVER_IP" ]; then
 fi
 SERVER_IP="${SERVER_IP:-YOUR_SERVER_IP}"
 
-SHARE_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&sni=${DEST_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision#Reality_AntiLeak"
+# 修改点：节点别名改为 Reality (去掉 _Auto)
+SHARE_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&sni=${DEST_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision#Reality"
 
+# 修改点 2：结尾去掉了多余文字，改为红色加粗
 echo ""
-echo "=========================================================="
-echo "                部署完成 "
-echo "=========================================================="
+echo -e "${RED_BOLD}==========================================================${RESET}"
+echo -e "${RED_BOLD}                      部署完成                            ${RESET}"
+echo -e "${RED_BOLD}==========================================================${RESET}"
 echo " 地址 (IP):       ${SERVER_IP}"
 echo " 端口 (Port):     ${PORT}"
 echo " 伪装域名 (SNI):  ${DEST_DOMAIN}"
 echo " UUID:            ${UUID}"
-echo " ShortId:         ${SHORT_ID}"
 echo " Public Key:      ${PUBLIC_KEY}"
-echo " Dokodemo Port:   ${INTERNAL_PORT} (内部回落监听)"
+echo " Dokodemo Port:   ${INTERNAL_PORT} (内部回落)"
 echo "----------------------------------------------------------"
 echo " VLESS 分享链接:"
 echo "${SHARE_LINK}"
