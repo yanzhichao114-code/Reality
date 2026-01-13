@@ -12,7 +12,6 @@ fi
 RED_BOLD="\033[31;1m"
 RESET="\033[0m"
 
-# 修改点 1：标题去掉了多余文字，改为红色加粗
 echo -e "${RED_BOLD}==========================================================${RESET}"
 echo -e "${RED_BOLD}                 Xray Reality 脚本                        ${RESET}"
 echo -e "${RED_BOLD}==========================================================${RESET}"
@@ -281,21 +280,39 @@ if ! "$XRAY_BIN" run -test -config /usr/local/etc/xray/config.json >/dev/null 2>
   exit 1
 fi
 
-# --- 10. 启动并校验服务 ---
+# --- 10. 启动并校验服务 (已更新为循环重试机制) ---
 
 echo "正在启动 Xray..."
 systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl enable xray >/dev/null 2>&1 || true
 systemctl restart xray
 
+# 1. 先检查服务状态是否报错
 if ! systemctl is-active --quiet xray; then
   echo "错误: Xray 服务启动失败。请查看日志：journalctl -u xray -n 80"
   exit 1
 fi
 
-# 自检：确认端口监听
-if ! ss -H -lntp "sport = :$PORT" | grep -q xray; then
-  echo "错误: 未检测到 xray 监听端口 $PORT。"
+# 2. 循环检查端口监听 (解决启动时序问题)
+echo "正在检查端口监听状态..."
+CHECK_COUNT=0
+MAX_RETRIES=10
+
+while [ $CHECK_COUNT -lt $MAX_RETRIES ]; do
+  if ss -H -lntp "sport = :$PORT" | grep -q xray; then
+    echo "✅ 检测到 Xray 端口 $PORT 启动成功。"
+    break
+  fi
+  
+  echo "端口尚未就绪，等待 1 秒... ($((CHECK_COUNT+1))/$MAX_RETRIES)"
+  sleep 1
+  CHECK_COUNT=$((CHECK_COUNT+1))
+done
+
+# 3. 如果重试 10 次后仍未成功，则判定失败
+if [ $CHECK_COUNT -eq $MAX_RETRIES ]; then
+  echo "❌ 错误: 超时未检测到 xray 监听端口 $PORT。"
+  echo "当前端口占用情况:"
   ss -lntp "sport = :$PORT" || true
   exit 1
 fi
@@ -311,7 +328,6 @@ SERVER_IP="${SERVER_IP:-YOUR_SERVER_IP}"
 # 修改点：节点别名改为 Reality (去掉 _Auto)
 SHARE_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&sni=${DEST_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision#Reality"
 
-# 修改点 2：结尾去掉了多余文字，改为红色加粗
 echo ""
 echo -e "${RED_BOLD}==========================================================${RESET}"
 echo -e "${RED_BOLD}                      部署完成                            ${RESET}"
